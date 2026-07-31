@@ -9,10 +9,12 @@
 // foreign calls, so single-threaded usage must be enforced by the caller.
 
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <vector>
 
 #include "ck_tile/dispatcher.hpp"
 
@@ -25,6 +27,19 @@ using namespace ck_tile::dispatcher;
 static std::unique_ptr<FmhaRegistry> g_registry;
 static std::unique_ptr<FmhaDispatcher> g_dispatcher;
 static bool g_initialized = false;
+
+static int benchmark_iterations_from_env(const char* name, int fallback, int minimum)
+{
+    const char* value = std::getenv(name);
+    if(!value || !*value)
+        return fallback;
+
+    char* end   = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if(end == value || *end != '\0' || parsed < minimum || parsed > 100000)
+        return fallback;
+    return static_cast<int>(parsed);
+}
 
 #define HIP_CHECK(call)           \
     do                            \
@@ -84,8 +99,9 @@ static float run_single_kernel(const FmhaInvocation& invocation)
     if(g_dispatcher)
     {
         sc.time_kernel_ = true;
-        sc.cold_niters_ = 10;
-        sc.nrepeat_     = 50;
+        sc.cold_niters_ =
+            benchmark_iterations_from_env("CK_FMHA_BENCH_COLD_NITERS", 10, 0);
+        sc.nrepeat_ = benchmark_iterations_from_env("CK_FMHA_BENCH_NREPEAT", 50, 1);
     }
     return kernels.front()->run(invocation, sc);
 }
@@ -1432,6 +1448,7 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
                                       float scale,
                                       int mask_type_int,
                                       int bias_type_int,
+                                      int qscale_type_int,
                                       int page_block_size,
                                       int kv_layout_int,
                                       int kv_lookup_int,
@@ -1460,13 +1477,16 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
         page_block_size = 64;
     const int pages_per_seq     = (seqlen_k + page_block_size - 1) / page_block_size;
     const int total_pages       = batch * pages_per_seq;
-    const int64_t kv_page_bytes = static_cast<int64_t>(total_pages) * nhead_k * page_block_size *
-                                  std::max(hdim_q, hdim_v) * in_bytes;
+    const int64_t k_page_bytes =
+        static_cast<int64_t>(total_pages) * nhead_k * page_block_size * hdim_q * in_bytes;
+    const int64_t v_page_bytes =
+        static_cast<int64_t>(total_pages) * nhead_k * page_block_size * hdim_v * in_bytes;
 
     void *q_dev = nullptr, *k_dev = nullptr, *v_dev = nullptr, *o_dev = nullptr;
     void *lse_dev = nullptr, *seqstart_q_dev = nullptr;
     void *kv_indptr_dev = nullptr, *kv_page_indices_dev = nullptr, *kv_last_page_dev = nullptr;
     void *seqlen_k_dev = nullptr, *bias_dev = nullptr, *sink_dev = nullptr;
+    void *q_descale_dev = nullptr, *k_descale_dev = nullptr, *v_descale_dev = nullptr;
 
     fmha_batch_prefill_traits traits{};
     traits.hdim_q              = hdim_q;
@@ -1481,7 +1501,7 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
     traits.has_logits_soft_cap = (has_logits != 0);
     traits.skip_min_seqlen_q   = (skip_min_seqlen_q != 0);
     traits.has_sink            = (has_sink != 0);
-    traits.qscale_type         = quant_scale_enum::no_scale;
+    traits.qscale_type         = static_cast<quant_scale_enum>(qscale_type_int);
     traits.kv_memory_layout =
         static_cast<ck_tile::BlockAttentionKVCacheMemoryLayoutEnum>(kv_layout_int);
     traits.kv_lookup_table =
@@ -1503,11 +1523,110 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
         last_page[b] = seqlen_k - (pages_per_seq - 1) * page_block_size;
     std::vector<int> sk_vec(batch, seqlen_k);
 
+    // The Python benchmark uses conventional [B,H,S,D] host tensors. Pack Q
+    // into group-mode [B,S,H,D] order and K/V into the exact paged cache
+    // layout selected by the candidate. Packing is outside the timed region.
+    std::vector<uint8_t> q_group(q_bytes);
+    std::vector<uint8_t> k_pages(k_page_bytes, 0);
+    std::vector<uint8_t> v_pages(v_page_bytes, 0);
+    std::vector<uint8_t> o_group(o_bytes, 0);
+    const auto* q_src = static_cast<const uint8_t*>(q_host);
+    const auto* k_src = static_cast<const uint8_t*>(k_host);
+    const auto* v_src = static_cast<const uint8_t*>(v_host);
+    auto* o_dst       = static_cast<uint8_t*>(o_host);
+    const bool is_vectorized =
+        kv_layout_int ==
+        static_cast<int>(ck_tile::BlockAttentionKVCacheMemoryLayoutEnum::VECTORIZED_LAYOUT);
+    const int vector_size = 16 / in_bytes;
+
+    for(int b = 0; b < batch; ++b)
+        for(int t = 0; t < seqlen_q; ++t)
+            for(int h = 0; h < nhead_q; ++h)
+            {
+                const int64_t src =
+                    ((static_cast<int64_t>(b) * nhead_q + h) * seqlen_q + t) * hdim_q;
+                const int64_t dst =
+                    ((static_cast<int64_t>(b) * seqlen_q + t) * nhead_q + h) * hdim_q;
+                std::memcpy(q_group.data() + dst * in_bytes,
+                            q_src + src * in_bytes,
+                            static_cast<size_t>(hdim_q) * in_bytes);
+            }
+
+    for(int b = 0; b < batch; ++b)
+        for(int h = 0; h < nhead_k; ++h)
+            for(int t = 0; t < seqlen_k; ++t)
+            {
+                const int page        = b * pages_per_seq + t / page_block_size;
+                const int page_offset = t % page_block_size;
+                const int64_t k_src_base =
+                    ((static_cast<int64_t>(b) * nhead_k + h) * seqlen_k + t) * hdim_q;
+                const int64_t v_src_base =
+                    ((static_cast<int64_t>(b) * nhead_k + h) * seqlen_k + t) * hdim_v;
+
+                if(is_vectorized)
+                {
+                    for(int d = 0; d < hdim_q; d += vector_size)
+                    {
+                        const int64_t dst =
+                            ((((static_cast<int64_t>(page) * nhead_k + h) *
+                               (hdim_q / vector_size) +
+                               d / vector_size) *
+                                  page_block_size +
+                              page_offset) *
+                             vector_size);
+                        std::memcpy(k_pages.data() + dst * in_bytes,
+                                    k_src + (k_src_base + d) * in_bytes,
+                                    static_cast<size_t>(vector_size) * in_bytes);
+                    }
+                    for(int d = 0; d < hdim_v; ++d)
+                    {
+                        const int64_t dst =
+                            ((((static_cast<int64_t>(page) * nhead_k + h) *
+                               (page_block_size / vector_size) +
+                               page_offset / vector_size) *
+                                  hdim_v +
+                              d) *
+                                 vector_size +
+                             page_offset % vector_size);
+                        std::memcpy(v_pages.data() + dst * in_bytes,
+                                    v_src + (v_src_base + d) * in_bytes,
+                                    in_bytes);
+                    }
+                }
+                else
+                {
+                    const int64_t k_dst =
+                        ((static_cast<int64_t>(page) * page_block_size + page_offset) *
+                             nhead_k +
+                         h) *
+                        hdim_q;
+                    const int64_t v_dst =
+                        ((static_cast<int64_t>(page) * page_block_size + page_offset) *
+                             nhead_k +
+                         h) *
+                        hdim_v;
+                    std::memcpy(k_pages.data() + k_dst * in_bytes,
+                                k_src + k_src_base * in_bytes,
+                                static_cast<size_t>(hdim_q) * in_bytes);
+                    std::memcpy(v_pages.data() + v_dst * in_bytes,
+                                v_src + v_src_base * in_bytes,
+                                static_cast<size_t>(hdim_v) * in_bytes);
+                }
+            }
+
+    const float unit_descale = 1.0f;
+
+    // The focused benchmark supports unscaled BF16/FP16 and FP8 per-tensor
+    // scaling. KV block-scale needs a separate per-page scale tensor.
+    if(qscale_type_int != static_cast<int>(quant_scale_enum::no_scale) &&
+       qscale_type_int != static_cast<int>(quant_scale_enum::pertensor))
+        return -3;
+
     fmha_batch_prefill_args args{};
 
     HIP_CHECK(hipMalloc(&q_dev, q_bytes));
-    HIP_CHECK(hipMalloc(&k_dev, kv_page_bytes));
-    HIP_CHECK(hipMalloc(&v_dev, kv_page_bytes));
+    HIP_CHECK(hipMalloc(&k_dev, k_page_bytes));
+    HIP_CHECK(hipMalloc(&v_dev, v_page_bytes));
     HIP_CHECK(hipMalloc(&o_dev, o_bytes));
 
     HIP_CHECK(hipMalloc(&seqstart_q_dev, (batch + 1) * sizeof(int)));
@@ -1551,18 +1670,35 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
         HIP_CHECK(hipMemset(sink_dev, 0, nhead_q * sizeof(float)));
     }
 
-    HIP_CHECK(hipMemcpy(q_dev, q_host, q_bytes, hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemset(k_dev, 0, kv_page_bytes));
-    HIP_CHECK(hipMemset(v_dev, 0, kv_page_bytes));
-    HIP_CHECK(hipMemset(o_dev, 0, o_bytes));
+    if(qscale_type_int == static_cast<int>(quant_scale_enum::pertensor))
+    {
+        HIP_CHECK(hipMalloc(&q_descale_dev, sizeof(float)));
+        HIP_CHECK(hipMalloc(&k_descale_dev, sizeof(float)));
+        HIP_CHECK(hipMalloc(&v_descale_dev, sizeof(float)));
+        HIP_CHECK(
+            hipMemcpy(q_descale_dev, &unit_descale, sizeof(float), hipMemcpyHostToDevice));
+        HIP_CHECK(
+            hipMemcpy(k_descale_dev, &unit_descale, sizeof(float), hipMemcpyHostToDevice));
+        HIP_CHECK(
+            hipMemcpy(v_descale_dev, &unit_descale, sizeof(float), hipMemcpyHostToDevice));
+    }
+
+    HIP_CHECK(hipMemcpy(q_dev, q_group.data(), q_bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(k_dev, k_pages.data(), k_page_bytes, hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(v_dev, v_pages.data(), v_page_bytes, hipMemcpyHostToDevice));
+    // Seed every output byte with 0xff, which is a NaN encoding for the
+    // floating output types exercised here. A candidate that fails to write
+    // a token/head lane must fail validation instead of inheriting a benign
+    // zero from the benchmark harness.
+    HIP_CHECK(hipMemset(o_dev, 0xff, o_bytes));
 
     args.q_ptr           = q_dev;
     args.k_ptr           = k_dev;
     args.v_ptr           = v_dev;
     args.bias_ptr        = bias_dev;
-    args.q_descale_ptr   = nullptr;
-    args.k_descale_ptr   = nullptr;
-    args.v_descale_ptr   = nullptr;
+    args.q_descale_ptr   = q_descale_dev;
+    args.k_descale_ptr   = k_descale_dev;
+    args.v_descale_ptr   = v_descale_dev;
     args.rand_val_ptr    = nullptr;
     args.lse_ptr         = lse_dev;
     args.o_ptr           = o_dev;
@@ -1594,8 +1730,8 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
 
     // Group-mode strides: [total_tokens, nhead, hdim]
     args.stride_q             = nhead_q * hdim_q;
-    args.stride_k             = hdim_q;
-    args.stride_v             = hdim_v;
+    args.stride_k             = is_vectorized ? vector_size : nhead_k * hdim_q;
+    args.stride_v             = is_vectorized ? vector_size : nhead_k * hdim_v;
     args.stride_bias          = 0;
     args.stride_randval       = 0;
     args.stride_o             = nhead_q * hdim_v;
@@ -1614,7 +1750,11 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
     args.batch_stride_lse     = static_cast<int64_t>(nhead_q) * seqlen_q;
     args.batch_stride_o       = 0;
     args.window_size_left     = -1;
-    args.window_size_right    = -1;
+    args.window_size_right    =
+        mask_type_int == static_cast<int>(mask_enum::mask_top_left) ||
+                mask_type_int == static_cast<int>(mask_enum::mask_bottom_right)
+            ? 0
+            : -1;
     args.sink_size            = 0;
     args.mask_type            = mask_type_int;
     args.p_drop               = has_dropout ? 0.2f : 0.0f;
@@ -1647,9 +1787,26 @@ int fmha_dispatcher_run_batch_prefill(const void* q_host,
     }
 
     {
-        hipError_t cpy = hipMemcpy(o_host, o_dev, o_bytes, hipMemcpyDeviceToHost);
+        hipError_t cpy = hipMemcpy(o_group.data(), o_dev, o_bytes, hipMemcpyDeviceToHost);
         if(cpy != hipSuccess)
             rc = -1;
+        else
+        {
+            for(int b = 0; b < batch; ++b)
+                for(int t = 0; t < seqlen_q; ++t)
+                    for(int h = 0; h < nhead_q; ++h)
+                    {
+                        const int64_t src =
+                            ((static_cast<int64_t>(b) * seqlen_q + t) * nhead_q + h) *
+                            hdim_v;
+                        const int64_t dst =
+                            ((static_cast<int64_t>(b) * nhead_q + h) * seqlen_q + t) *
+                            hdim_v;
+                        std::memcpy(o_dst + dst * out_bytes,
+                                    o_group.data() + src * out_bytes,
+                                    static_cast<size_t>(hdim_v) * out_bytes);
+                    }
+        }
     }
     if(time_ms_out)
         *time_ms_out = elapsed;
@@ -1667,6 +1824,9 @@ cleanup:
     safe_hip_free(seqlen_k_dev);
     safe_hip_free(bias_dev);
     safe_hip_free(sink_dev);
+    safe_hip_free(q_descale_dev);
+    safe_hip_free(k_descale_dev);
+    safe_hip_free(v_descale_dev);
     return rc;
 }
 

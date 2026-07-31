@@ -46,6 +46,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "common"))
 from parallel_runner import run_parallel_on_gpus  # noqa: E402
 
 
+def _random_fp8_e4m3fnuz(shape) -> np.ndarray:
+    """Generate valid E4M3 FNUZ bytes in [-1, 1] without float recasting."""
+    codes = np.random.randint(0, 65, size=shape, dtype=np.uint8)
+    signs = np.random.randint(0, 2, size=shape, dtype=np.uint8)
+    codes |= signs << 7
+    # FNUZ reserves 0x80 for NaN rather than negative zero.
+    codes[codes == 0x80] = 0
+    return codes
+
+
+def _fp8_e4m3fnuz_to_float32(codes: np.ndarray) -> np.ndarray:
+    """Decode AMD E4M3 FNUZ bytes for the CPU correctness reference."""
+    bits = codes.astype(np.uint8, copy=False)
+    magnitude = bits & np.uint8(0x7F)
+    exponent = (magnitude >> np.uint8(3)).astype(np.int32)
+    mantissa = (magnitude & np.uint8(0x07)).astype(np.float32)
+    normal = (1.0 + mantissa / 8.0) * np.exp2(exponent - 8).astype(np.float32)
+    subnormal = mantissa * (2.0**-10)
+    value = np.where(exponent == 0, subnormal, normal).astype(np.float32)
+    value = np.where((bits & np.uint8(0x80)) != 0, -value, value)
+    value = np.where(magnitude == 0, 0.0, value)
+    value = np.where(bits == 0x80, np.nan, value)
+    return value.astype(np.float32, copy=False)
+
+
 def _compute_result(
     config,
     prob,
@@ -65,16 +90,38 @@ def _compute_result(
     tflops = prob.num_ops / (time_ms * 1e-3) / 1e12 if time_ms > 0 else 0
     if is_causal and time_ms > 0:
         sq, sk = prob.seqlen_q, prob.seqlen_k
-        causal_ratio = (min(sq, sk) + 1) / (2.0 * sk)
+        if config.mask == "bottom_right":
+            # Cached suffix attention aligns Sq to the right edge of Sk.  For
+            # the common Sq<=Sk case, almost the full rectangular matrix is
+            # valid; using the top-left triangular fraction understates work
+            # badly when Sk is much larger than Sq.
+            if sq <= sk:
+                valid = sq * sk - sq * (sq - 1) // 2
+            else:
+                valid = sk * (sk + 1) // 2
+        else:
+            # Top-left causal attention is triangular until Q outgrows K,
+            # after which each additional Q row attends all K positions.
+            n = min(sq, sk)
+            valid = n * (n + 1) // 2 + max(sq - sk, 0) * sk
+        causal_ratio = valid / (sq * sk)
         tflops = prob.num_ops * causal_ratio / (time_ms * 1e-3) / 1e12
 
     max_err = 0.0
     status = "OK"
-    if ref is not None and output is not None:
-        max_err = float(np.abs(output.astype(np.float32) - ref).max())
-        atol, rtol = dtype_tol
-        tol = atol + rtol * np.abs(ref).max()
-        status = "PASS" if max_err < tol else "FAIL"
+    if output is not None:
+        output_f32 = output.astype(np.float32)
+        if not np.isfinite(output_f32).all():
+            # The output buffer is NaN-initialized by the batch-prefill
+            # wrapper. Any non-finite lane therefore also detects incomplete
+            # token/head coverage, not only arithmetic failures.
+            max_err = float("inf")
+            status = "FAIL"
+        elif ref is not None:
+            max_err = float(np.abs(output_f32 - ref).max())
+            atol, rtol = dtype_tol
+            tol = atol + rtol * np.abs(ref).max()
+            status = "PASS" if max_err < tol else "FAIL"
 
     splits_tag = f"  [ns={ns}]" if api_family == "splitkv" else ""
     display_name = f"{config.name}{splits_tag}"
@@ -189,7 +236,7 @@ runner.cleanup()
 
 
 def parse_problems(spec: str) -> List[FmhaProblem]:
-    """Parse problem specs: 'batch,nhead,seqlen,hdim;...'"""
+    """Parse 4-, 6-, or 7-field problem specs separated by semicolons."""
     problems = []
     for part in spec.split(";"):
         vals = [int(x) for x in part.split(",")]
@@ -219,6 +266,24 @@ def parse_problems(spec: str) -> List[FmhaProblem]:
                     hdim_v=d,
                 )
             )
+        elif len(vals) == 7:
+            b, hq, hk, sq, sk, dq, dv = vals
+            problems.append(
+                FmhaProblem(
+                    batch=b,
+                    nhead_q=hq,
+                    nhead_k=hk,
+                    seqlen_q=sq,
+                    seqlen_k=sk,
+                    hdim_q=dq,
+                    hdim_v=dv,
+                )
+            )
+        else:
+            raise ValueError(
+                "Problem must be B,H,S,D; B,Hq,Hk,Sq,Sk,D; or "
+                f"B,Hq,Hk,Sq,Sk,Dq,Dv, got {part!r}"
+            )
     return problems
 
 
@@ -234,7 +299,10 @@ def main():
     parser.add_argument(
         "--problems",
         default="2,8,1024,128",
-        help="Problem sizes: batch,nhead,seqlen,hdim",
+        help=(
+            "Problem sizes: B,H,S,D; B,Hq,Hk,Sq,Sk,D; or "
+            "B,Hq,Hk,Sq,Sk,Dq,Dv"
+        ),
     )
 
     parser.add_argument(
@@ -477,7 +545,7 @@ def main():
         "bf16": np.float32,
         "fp32": np.float32,
         "fp8": np.float16,
-        "fp8bf16": np.float16,
+        "fp8bf16": np.uint8,
         "fp8fp32": np.float16,
         "bf8": np.float16,
         "mxfp8": np.float16,
@@ -489,7 +557,7 @@ def main():
         "bf16": (1e-2, 1e-2),
         "fp32": (1e-5, 1e-5),
         "fp8": (16.0, 0.0),
-        "fp8bf16": (16.0, 0.0),
+        "fp8bf16": (1.25e-1, 5e-2),
         "fp8fp32": (16.0, 0.0),
         "bf8": (16.0, 0.0),
         "mxfp8": (16.0, 0.0),
@@ -504,12 +572,18 @@ def main():
         first_mask = all_configs[0].mask if all_configs else "no"
         np_dtype = dtype_map.get(first_dtype, np.float16)
         dtype_tol = _DTYPE_TOL.get(first_dtype, (1e-2, 1e-2))
-        # Use uniform [0, 1] like CK example (default 'uf' mode) -- produces
-        # peaked softmax distributions that actually test kernel correctness.
-        # randn*0.1 makes softmax nearly uniform for large hdim, hiding bugs.
-        Q = np.random.uniform(0, 1, prob.q_shape()).astype(np_dtype)
-        K = np.random.uniform(0, 1, prob.k_shape()).astype(np_dtype)
-        V = np.random.uniform(0, 1, prob.v_shape()).astype(np_dtype)
+        if first_dtype == "fp8bf16":
+            # Keep the encoded bytes intact. Casting float NumPy data to uint8
+            # does not produce FP8 and previously made validation meaningless.
+            Q = _random_fp8_e4m3fnuz(prob.q_shape())
+            K = _random_fp8_e4m3fnuz(prob.k_shape())
+            V = _random_fp8_e4m3fnuz(prob.v_shape())
+        else:
+            # Uniform [0, 1] produces nontrivial softmax distributions. The
+            # older randn*0.1 input could hide attention indexing bugs.
+            Q = np.random.uniform(0, 1, prob.q_shape()).astype(np_dtype)
+            K = np.random.uniform(0, 1, prob.k_shape()).astype(np_dtype)
+            V = np.random.uniform(0, 1, prob.v_shape()).astype(np_dtype)
 
         _MASK_INT = {"no": 0, "top_left": 1, "bottom_right": 2, "generic": 3}
         first_mask_int = _MASK_INT.get(first_mask, 0)
@@ -524,6 +598,10 @@ def main():
                 Q_ref = _bf16_to_float32(_float32_to_bf16(Q.astype(np.float32)))
                 K_ref = _bf16_to_float32(_float32_to_bf16(K.astype(np.float32)))
                 V_ref = _bf16_to_float32(_float32_to_bf16(V.astype(np.float32)))
+            elif first_dtype == "fp8bf16":
+                Q_ref = _fp8_e4m3fnuz_to_float32(Q)
+                K_ref = _fp8_e4m3fnuz_to_float32(K)
+                V_ref = _fp8_e4m3fnuz_to_float32(V)
             else:
                 Q_ref = Q.astype(np.float32)
                 K_ref = K.astype(np.float32)
@@ -546,7 +624,12 @@ def main():
             if prob.seqlen_q == prob.seqlen_k
             else f"Sq={prob.seqlen_q} Sk={prob.seqlen_k}"
         )
-        prob_str = f"B={prob.batch} {h_str} {s_str} D={prob.hdim_q}"
+        d_str = (
+            f"D={prob.hdim_q}"
+            if prob.hdim_q == prob.hdim_v
+            else f"Dq={prob.hdim_q} Dv={prob.hdim_v}"
+        )
+        prob_str = f"B={prob.batch} {h_str} {s_str} {d_str}"
         print(f"\n  Problem [{prob_idx}]: {prob_str}")
         print(
             f"  {'Kernel':<105} {'Time(ms)':>10} {'TFLOPS':>10}"
@@ -555,6 +638,14 @@ def main():
         print(f"  {'-' * 145}")
 
         _BIAS_INT = {"no": 0, "bias": 1, "alibi": 2}
+        _QSCALE_INT = {
+            "no": 0,
+            "pertensor": 1,
+            "blockscale": 2,
+            "kv_blockscale": 3,
+        }
+        _KV_LAYOUT_INT = {"vectorized": 0, "linear": 1}
+        _KV_LOOKUP_INT = {"vllm": 0, "sglang": 1}
 
         # Build list of (config, setup, run_kwargs, ns) jobs for benchmarking
         bench_jobs = []
@@ -592,6 +683,11 @@ def main():
                     api_family=api_family,
                     window_left=-1,
                     window_right=0 if is_causal else -1,
+                    qscale_type=_QSCALE_INT.get(config.qscale, 0),
+                    page_size=config.page_size,
+                    kv_layout=_KV_LAYOUT_INT.get(config.kv_memory_layout, 0),
+                    kv_lookup=_KV_LOOKUP_INT.get(config.kv_lookup_table, 1),
+                    skip_min_seqlen_q=int(config.skip_min_seqlen_q),
                 )
                 if api_family == "splitkv":
                     run_kwargs["num_splits"] = ns
@@ -725,8 +821,16 @@ def main():
 
         print("\n  Best kernel per problem:")
         for key, results in by_problem.items():
-            best = max(results, key=lambda x: x["tflops"])
             prob = json.loads(key)
+            valid_results = [r for r in results if r["status"] in ("PASS", "OK")]
+            if not valid_results:
+                print(
+                    f"    B={prob['batch']} Hq={prob['nhead_q']} Hk={prob['nhead_k']}"
+                    f" Sq={prob['seqlen_q']} Sk={prob['seqlen_k']}"
+                    " -> no passing kernel"
+                )
+                continue
+            best = max(valid_results, key=lambda x: x["tflops"])
             ns_tag = f"  [ns={best['num_splits']}]" if best.get("num_splits") else ""
             h_str = (
                 f"H={prob['nhead_q']}"
@@ -840,8 +944,16 @@ def main():
             del row["problem"]
             key = _csv_key(r)
             prev = existing.get(key)
-            if prev is None or float(row.get("tflops", 0)) > float(
-                prev.get("tflops", 0)
+            row_passes = row.get("status") in ("PASS", "OK")
+            prev_passes = prev is not None and prev.get("status") in ("PASS", "OK")
+            if (
+                prev is None
+                or (row_passes and not prev_passes)
+                or (
+                    row_passes == prev_passes
+                    and float(row.get("tflops", 0))
+                    > float(prev.get("tflops", 0))
+                )
             ):
                 existing[key] = row
 

@@ -1,0 +1,9 @@
+{
+  "variant": "batch_prefill",
+  "trait_config": {
+    "data_type": {"values": ["fp8bf16"]},
+    "mask": {"values": ["bottom_right"]},
+    "bias": {"values": ["no"]},
+    "logits": {"values": [false]}
+  }
+}

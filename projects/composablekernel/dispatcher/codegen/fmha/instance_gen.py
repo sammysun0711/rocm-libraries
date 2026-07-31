@@ -2380,7 +2380,7 @@ def _expand_batch_prefill(
     arch, dtypes, receipt, allowed_masks, allowed_biases, restrict_hdims=None
 ):
     configs = []
-    page_sizes = [1, 16, 1024]
+    page_sizes = [1, 16, 64, 1024]
 
     def _bp_bk1(bm0, bn0, bk0, hq):
         if bm0 == 64 and bn0 == 128 and bk0 == 64 and hq == 128:
@@ -2403,60 +2403,69 @@ def _expand_batch_prefill(
                     continue
 
                 for spec in bp_specs:
-                    mm = _MASK_MAP.get(spec.mask, spec.mask)
+                    canonical_mask = _MASK_MAP.get(spec.mask, spec.mask)
+                    # The simplified causal mask template handles both
+                    # alignments. Cached suffix prefill (Sq < Sk) requires the
+                    # bottom-right runtime key, so register it explicitly too.
+                    mask_variants = (
+                        ["top_left", "bottom_right"]
+                        if spec.mask == "causal"
+                        else [canonical_mask]
+                    )
                     mb = _BIAS_MAP.get(spec.bias, spec.bias)
-                    if allowed_masks is not None and mm not in allowed_masks:
-                        continue
-                    if allowed_biases is not None and mb not in allowed_biases:
-                        continue
-                    for ps in page_sizes:
-                        if ps == 1 and spec.kv_memory_layout != "linear":
+                    for mm in mask_variants:
+                        if allowed_masks is not None and mm not in allowed_masks:
                             continue
-                        if spec.qscale == "kv_blockscale" and ps < tc.bn0:
+                        if allowed_biases is not None and mb not in allowed_biases:
                             continue
-                        configs.append(
-                            FmhaKernelConfig(
-                                family="batch_prefill",
-                                data_type=dtype,
-                                mode="group",
-                                hdim_q=hq,
-                                hdim_v=hv,
-                                pipeline="qr_async",
-                                tile_m0=tc.bm0,
-                                tile_n0=tc.bn0,
-                                tile_k0=tc.bk0,
-                                tile_n1=tc.bn1,
-                                tile_k1=bk1,
-                                tile_k0max=tc.bk0max,
-                                wave_m0=tc.rm0,
-                                wave_n0=1,
-                                wave_k0=1,
-                                wave_m1=tc.rm0,
-                                wave_n1=1,
-                                wave_k1=1,
-                                warp_m0=tc.wm0,
-                                warp_n0=tc.wn0,
-                                warp_k0=tc.wk0,
-                                warp_m1=tc.wm1,
-                                warp_n1=tc.wn1,
-                                warp_k1=tc.wk1,
-                                pad_s=1,
-                                pad_sk=1,
-                                pad_d=1,
-                                pad_dv=1,
-                                mask=mm,
-                                bias=mb,
-                                lse=(spec.lse == "t"),
-                                dropout=(spec.dropout == "t"),
-                                logits=(spec.logits == "t"),
-                                paged_kv=True,
-                                page_size=ps,
-                                kv_memory_layout=spec.kv_memory_layout,
-                                kv_lookup_table=spec.kv_lookup_table,
-                                qscale=spec.qscale,
-                                gfx_arch=arch,
+                        for ps in page_sizes:
+                            if ps == 1 and spec.kv_memory_layout != "linear":
+                                continue
+                            if spec.qscale == "kv_blockscale" and ps < tc.bn0:
+                                continue
+                            configs.append(
+                                FmhaKernelConfig(
+                                    family="batch_prefill",
+                                    data_type=dtype,
+                                    mode="group",
+                                    hdim_q=hq,
+                                    hdim_v=hv,
+                                    pipeline="qr_async",
+                                    tile_m0=tc.bm0,
+                                    tile_n0=tc.bn0,
+                                    tile_k0=tc.bk0,
+                                    tile_n1=tc.bn1,
+                                    tile_k1=bk1,
+                                    tile_k0max=tc.bk0max,
+                                    wave_m0=tc.rm0,
+                                    wave_n0=1,
+                                    wave_k0=1,
+                                    wave_m1=tc.rm0,
+                                    wave_n1=1,
+                                    wave_k1=1,
+                                    warp_m0=tc.wm0,
+                                    warp_n0=tc.wn0,
+                                    warp_k0=tc.wk0,
+                                    warp_m1=tc.wm1,
+                                    warp_n1=tc.wn1,
+                                    warp_k1=tc.wk1,
+                                    pad_s=1,
+                                    pad_sk=1,
+                                    pad_d=1,
+                                    pad_dv=1,
+                                    mask=mm,
+                                    bias=mb,
+                                    lse=(spec.lse == "t"),
+                                    dropout=(spec.dropout == "t"),
+                                    logits=(spec.logits == "t"),
+                                    paged_kv=True,
+                                    page_size=ps,
+                                    kv_memory_layout=spec.kv_memory_layout,
+                                    kv_lookup_table=spec.kv_lookup_table,
+                                    qscale=spec.qscale,
+                                    gfx_arch=arch,
+                                )
                             )
-                        )
     return configs
 
 

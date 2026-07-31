@@ -36,6 +36,8 @@ DTYPE_NP = {
     "fp8fp32": np.float16,
 }
 
+QSCALE_INT = {"no": 0, "pertensor": 1, "blockscale": 2, "kv_blockscale": 3}
+
 
 def _run_one(idx, so_path, s, cfg):
     prob = FmhaProblem(
@@ -97,6 +99,7 @@ def _run_one(idx, so_path, s, cfg):
             has_skip=cfg.get("has_skip", 0),
             api_family=api,
             data_type=cfg.get("data_type", "fp16"),
+            qscale_type=QSCALE_INT.get(cfg.get("qscale", "no"), 0),
             page_size=cfg.get("page_size", 16),
             kv_layout=cfg.get("kv_layout", 0),
             kv_lookup=cfg.get("kv_lookup", 1),

@@ -619,6 +619,7 @@ class FmhaDispatcherLib:
             ctypes.c_float,
             ctypes.c_int,  # mask_type
             ctypes.c_int,  # bias_type
+            ctypes.c_int,  # qscale_type
             ctypes.c_int,  # page_block_size
             ctypes.c_int,  # kv_layout_int
             ctypes.c_int,  # kv_lookup_int
@@ -826,7 +827,7 @@ class FmhaRunner:
             "fp16": np.float16,
             "bf16": np.uint16,
             "fp32": np.float32,
-            "fp8bf16": np.float16,
+            "fp8bf16": np.uint16,
             "fp8fp32": np.float32,
             "bf8": np.uint8,
         }
@@ -841,6 +842,54 @@ class FmhaRunner:
             K_c = np.ascontiguousarray(K.astype(in_dt))
             V_c = np.ascontiguousarray(V.astype(in_dt))
         O_c = np.zeros(prob.o_shape(), dtype=out_dt)
+
+        # Batch prefill's ctypes wrapper accepts conventional host tensors,
+        # packs them into group/paged layouts outside the timed region, and
+        # copies the result back to host. Avoid the generic runner's redundant
+        # device allocation/copy path here.
+        if api_family == "batch_prefill":
+            time_ms = ctypes.c_float(0.0)
+            lib = self._lib._lib
+            rc = lib.fmha_dispatcher_run_batch_prefill(
+                Q_c.ctypes.data_as(ctypes.c_void_p),
+                K_c.ctypes.data_as(ctypes.c_void_p),
+                V_c.ctypes.data_as(ctypes.c_void_p),
+                O_c.ctypes.data_as(ctypes.c_void_p),
+                prob.batch,
+                prob.nhead_q,
+                prob.nhead_k,
+                prob.seqlen_q,
+                prob.seqlen_k,
+                prob.hdim_q,
+                prob.hdim_v,
+                prob.scale,
+                mask_type,
+                bias_type,
+                kwargs.get("qscale_type", 0),
+                kwargs.get("page_size", 64),
+                kwargs.get("kv_layout", 0),
+                kwargs.get("kv_lookup", 1),
+                kwargs.get("is_v_rowmajor", 1),
+                data_type.encode(),
+                has_lse,
+                has_dropout,
+                has_logits,
+                has_sink,
+                kwargs.get("skip_min_seqlen_q", 0),
+                ctypes.byref(time_ms),
+            )
+            if rc != 0:
+                return FmhaResult(success=False, error=f"Kernel failed (rc={rc})")
+            if data_type in ("bf16", "fp8bf16"):
+                O_c = _bf16_to_float32(O_c)
+            tflops = (
+                prob.num_ops / (time_ms.value * 1e-3) / 1e12
+                if time_ms.value > 0
+                else 0.0
+            )
+            return FmhaResult(
+                success=True, output=O_c, time_ms=time_ms.value, tflops=tflops
+            )
 
         d_q, d_k, d_v, d_o = (ctypes.c_void_p() for _ in range(4))
 
@@ -946,35 +995,6 @@ class FmhaRunner:
                     data_type.encode(),
                     ctypes.byref(time_ms),
                 )
-            elif api_family == "batch_prefill":
-                skip_min_sq = kwargs.get("skip_min_seqlen_q", 0)
-                rc = lib.fmha_dispatcher_run_batch_prefill(
-                    d_q,
-                    d_k,
-                    d_v,
-                    d_o,
-                    prob.batch,
-                    prob.nhead_q,
-                    prob.nhead_k,
-                    prob.seqlen_q,
-                    prob.seqlen_k,
-                    prob.hdim_q,
-                    prob.hdim_v,
-                    prob.scale,
-                    mask_type,
-                    bias_type,
-                    page_size,
-                    kv_layout,
-                    kv_lookup,
-                    is_v_rowmajor,
-                    data_type.encode(),
-                    has_lse,
-                    has_dropout,
-                    has_logits,
-                    has_sink,
-                    skip_min_sq,
-                    ctypes.byref(time_ms),
-                )
             else:
                 rc = lib.fmha_dispatcher_run_fwd(
                     d_q,
@@ -1013,7 +1033,7 @@ class FmhaRunner:
             self._hip.hipMemcpy(O_c.ctypes.data, d_o, O_c.nbytes, self.HIP_MEMCPY_D2H)
 
             # Convert bf16 output (uint16) back to float32 for comparison
-            if data_type == "bf16":
+            if data_type in ("bf16", "fp8bf16"):
                 O_c = _bf16_to_float32(O_c)
 
             # appendkv is a memory op (KV cache copy), not compute -- no TFLOPS
